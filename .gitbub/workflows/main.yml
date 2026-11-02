@@ -28,18 +28,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - name: ffmpeg දානවා
         run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
 
       - name: cloudflared දානවා (pair site ට public link එකක් හදන්න)
         run: |
-          curl -sL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x /usr/local/bin/cloudflared
+          sudo curl -sL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
 
       - name: Bot packages දානවා
-        run: npm install --legacy-peer-deps --ignore-scripts
+        run: npm install --legacy-peer-deps
 
       - name: Bot + pair link run කරනවා
         env:
