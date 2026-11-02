@@ -1,0 +1,82 @@
+name: DESHAN MD Bot Host
+
+on:
+  push:
+    branches: [main]      # file update කරාම — මේක trigger වෙනවා, කලින් run එක auto-cancel වෙනවා
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"  # සෑම පැය 5කටම — 24 පැයම chain වෙනවා
+
+# Rule: file update කලාම (push) → කලින් run වෙන workflow එක off වෙලා අලුත් එක start වෙනවා
+concurrency:
+  group: deshan-md-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # පැය 5 (GitHub max එක පැය 6යි)
+
+    steps:
+      - name: Code checkout කරනවා
+        uses: actions/checkout@v4
+
+      - name: Node 20 දානවා
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: ffmpeg දානවා
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+
+      - name: cloudflared දානවා (pair site ට public link එකක් හදන්න)
+        run: |
+          curl -sL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Bot packages දානවා
+        run: npm install --legacy-peer-deps --ignore-scripts
+
+      - name: Bot + pair link run කරනවා
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          OWNER_NUMBER: ${{ secrets.OWNER_NUMBER }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+          PORT: 8000
+        run: |
+          node --expose-gc index.js > bot.log 2>&1 &
+          BOT_PID=$!
+
+          echo "⏳ bot server start වෙනකම් balanවා..."
+          for i in $(seq 1 40); do
+            curl -s http://localhost:8000/ > /dev/null && break
+            sleep 3
+          done
+
+          cloudflared tunnel --url http://localhost:8000 > tunnel.log 2>&1 &
+          TUNNEL_PID=$!
+
+          PAIR_URL=""
+          echo "⏳ pair link එක generate වෙනකම් balanවා..."
+          for i in $(seq 1 30); do
+            PAIR_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -n1)
+            [ -n "$PAIR_URL" ] && break
+            sleep 2
+          done
+
+          echo "=================================================="
+          echo "🔗 PAIR SITE LINK:  ${PAIR_URL:-ERROR: link එක හම්බුණේ නෑ, tunnel.log බලන්න}"
+          echo "=================================================="
+          {
+            echo "## 🔗 Pair Site Link"
+            echo "${PAIR_URL:-⚠️ link එක හම්බුණේ නෑ — tunnel.log step එකේ බලන්න}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # මේ run එකේ ඉතුරු කාලයම bot එක + tunnel එක alive කරලා තියනවා
+          wait $BOT_PID
+          
