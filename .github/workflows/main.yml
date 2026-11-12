@@ -14,6 +14,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   run-bot:
@@ -24,40 +25,96 @@ jobs:
       - name: Code checkout කරනවා
         uses: actions/checkout@v4
 
-      - name: Node 20 දානවා
+      # 1. අලුත් file එකක් upload කරාම ආයේ Link Device නොවෙන්න කලින් Session එක Restore කරගන්නවා
+      - name: WhatsApp Session එක Restore කරනවා (No Re-link)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            session
+            sessions
+            auth_info_baileys
+            auth_info
+            .baileys
+          key: whatsapp-session-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            whatsapp-session-
+
+      - name: Node 20 දානවා (with Fast Cache)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: ffmpeg දානවා
-        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      # 2. හැම පාරම packages මුල ඉඳන් download වෙලා වෙලාව යන එක නවත්තන්න node_modules cache කරනවා
+      - name: Node Modules Cache කරනවා
+        id: npm-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+          restore-keys: |
+            node-modules-${{ runner.os }}-
 
-      - name: cloudflared දානවා (pair site ට public link එකක් හදන්න)
+      # 3. Network Speed Boost + System Tools (Cloudflare 1.1.1.1 DNS, TCP FastOpen, ffmpeg & cloudflared)
+      - name: Network Speed Boost + ffmpeg & cloudflared දානවා
         run: |
-          sudo curl -sL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          sudo chmod +x /usr/local/bin/cloudflared
+          # Fast DNS (Cloudflare 1.1.1.1 & Google 8.8.8.8) සහ TCP Socket Speed Tuning
+          sudo sysctl -w net.core.rmem_max=16777216 || true
+          sudo sysctl -w net.core.wmem_max=16777216 || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1 || true
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=15 || true
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf > /dev/null || true
+
+          # ffmpeg සහ cloudflared parallel විදිහට ඉක්මනින් install කරනවා
+          (sudo apt-get update -y && sudo apt-get install -y --no-install-recommends ffmpeg) &
+          (sudo curl -sL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && sudo chmod +x /usr/local/bin/cloudflared) &
+          wait
 
       - name: Bot packages දානවා
-        run: npm install --legacy-peer-deps
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm install --legacy-peer-deps --prefer-offline --no-audit --no-fund
 
-      - name: Bot + pair link run කරනවා
+      - name: Bot + pair link run කරනවා (High-Speed Network Mode)
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           OWNER_NUMBER: ${{ secrets.OWNER_NUMBER }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
           PORT: 8000
+          # Node.js Network & Crypto Speed Optimizations:
+          # ipv4first මගින් IPv6 timeout lag එක නැති කරනවා, UV_THREADPOOL_SIZE=64 මගින් parallel requests වේගවත් කරනවා
+          UV_THREADPOOL_SIZE: 64
+          NODE_OPTIONS: "--max-old-space-size=4096 --dns-result-order=ipv4first"
         run: |
+          # Session folders නැත්නම් හදනවා (cache save error නොවෙන්න)
+          mkdir -p session sessions auth_info_baileys auth_info
+
+          # කලින් run එක cancel වුණ ගමන් WhatsApp socket conflict නොවෙන්න තත්පර 5ක් ඉඳලා start කරනවා
+          sleep 5
+
+          # අලුත් file එකක් upload කරාම (cancel signal ආවම) bot එක safely close කරලා session save වෙන්න හදනවා
+          cleanup() {
+            echo "🛑 Workflow stop/update signal ආවා — WhatsApp session එක safely close කරනවා..."
+            kill -TERM "$BOT_PID" 2>/dev/null || true
+            kill -TERM "$TUNNEL_PID" 2>/dev/null || true
+            wait "$BOT_PID" 2>/dev/null || true
+            exit 0
+          }
+          trap cleanup INT TERM
+
           node --expose-gc index.js > bot.log 2>&1 &
           BOT_PID=$!
 
           echo "⏳ bot server start වෙනකම් balanවා..."
           for i in $(seq 1 40); do
             curl -s http://localhost:8000/ > /dev/null && break
-            sleep 3
+            sleep 2
           done
 
-          cloudflared tunnel --url http://localhost:8000 > tunnel.log 2>&1 &
+          # HTTP/2 protocol එකෙන් tunnel එක fast & stable විදිහට run කරනවා
+          cloudflared tunnel --url http://localhost:8000 --protocol http2 --no-autoupdate > tunnel.log 2>&1 &
           TUNNEL_PID=$!
 
           PAIR_URL=""
@@ -65,7 +122,7 @@ jobs:
           for i in $(seq 1 30); do
             PAIR_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -n1)
             [ -n "$PAIR_URL" ] && break
-            sleep 2
+            sleep 1
           done
 
           echo "=================================================="
@@ -76,5 +133,19 @@ jobs:
             echo "${PAIR_URL:-⚠️ link එක හම්බුණේ නෑ — tunnel.log step එකේ බලන්න}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # මේ run එකේ ඉතුරු කාලයම bot එක + tunnel එක alive කරලා තියනවා
-          wait $BOT_PID
+          # විනාඩි 290ක් (පැය 4 විනාඩි 50ක්) run කරලා timeout වෙන්න කලින් safely close කරනවා (එතකොට session එක 100% save වෙනවා)
+          timeout 290m tail --pid=$BOT_PID -f /dev/null || true
+          cleanup
+
+      # 4. Run එක ඉවර වුණත්, file එකක් upload කරලා cancel වුණත් (always) WhatsApp Session එක Save කරනවා
+      - name: WhatsApp Session එක Save කරනවා (Always)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            session
+            sessions
+            auth_info_baileys
+            auth_info
+            .baileys
+          key: whatsapp-session-${{ github.run_id }}-${{ github.run_attempt }}
